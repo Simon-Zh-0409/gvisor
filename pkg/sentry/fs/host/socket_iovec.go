@@ -21,6 +21,8 @@ import (
 	"gvisor.dev/gvisor/pkg/syserror"
 )
 
+// LINT.IfChange
+
 // maxIovs is the maximum number of iovecs to pass to the host.
 var maxIovs = linux.UIO_MAXIOV
 
@@ -111,3 +113,5 @@ func buildIovec(bufs [][]byte, maxlen int64, truncate bool) (length int64, iovec
 
 	return total, iovecs, nil, err
 }
+
+// LINT.ThenChange(../../fsimpl/host/socket_iovec.go)

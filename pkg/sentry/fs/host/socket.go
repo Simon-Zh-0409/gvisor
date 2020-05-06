@@ -37,6 +37,8 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
+// LINT.IfChange
+
 // maxSendBufferSize is the maximum host send buffer size allowed for endpoint.
 //
 // N.B. 8MB is the default maximum on Linux (2 * sysctl_wmem_max).
@@ -388,3 +390,5 @@ func (c *ConnectedEndpoint) Release() {
 
 // CloseUnread implements transport.ConnectedEndpoint.CloseUnread.
 func (c *ConnectedEndpoint) CloseUnread() {}
+
+// LINT.ThenChange(../../fsimpl/host/socket.go)

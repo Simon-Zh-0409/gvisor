@@ -217,6 +217,12 @@ func (r *Route) MTU() uint32 {
 	return r.ref.ep.MTU()
 }
 
+// NetworkProtocolNumber returns the NetworkProtocolNumber of the underlying
+// network endpoint.
+func (r *Route) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
+	return r.ref.ep.NetworkProtocolNumber()
+}
+
 // Release frees all resources associated with the route.
 func (r *Route) Release() {
 	if r.ref != nil {
@@ -254,4 +260,17 @@ func (r *Route) MakeLoopedRoute() Route {
 // Stack returns the instance of the Stack that owns this route.
 func (r *Route) Stack() *Stack {
 	return r.ref.stack()
+}
+
+// ReverseRoute returns new route with given source and destination address.
+func (r *Route) ReverseRoute(src tcpip.Address, dst tcpip.Address) Route {
+	return Route{
+		NetProto:          r.NetProto,
+		LocalAddress:      dst,
+		LocalLinkAddress:  r.RemoteLinkAddress,
+		RemoteAddress:     src,
+		RemoteLinkAddress: r.LocalLinkAddress,
+		ref:               r.ref,
+		Loop:              r.Loop,
+	}
 }

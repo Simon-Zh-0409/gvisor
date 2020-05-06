@@ -41,26 +41,19 @@ func (filesystemType) Name() string {
 	return "sockfs"
 }
 
-// filesystem implements vfs.FilesystemImpl.
-type filesystem struct {
-	kernfs.Filesystem
-}
-
 // NewFilesystem sets up and returns a new sockfs filesystem.
 //
 // Note that there should only ever be one instance of sockfs.Filesystem,
 // backing a global socket mount.
 func NewFilesystem(vfsObj *vfs.VirtualFilesystem) *vfs.Filesystem {
-	fs := &filesystem{}
-	fs.Init(vfsObj, filesystemType{})
+	fs := &kernfs.Filesystem{}
+	fs.VFSFilesystem().Init(vfsObj, filesystemType{}, fs)
 	return fs.VFSFilesystem()
 }
 
 // inode implements kernfs.Inode.
 //
-// TODO(gvisor.dev/issue/1476): Add device numbers to this inode (which are
-// not included in InodeAttrs) to store the numbers of the appropriate
-// socket device. Override InodeAttrs.Stat() accordingly.
+// TODO(gvisor.dev/issue/1193): Device numbers.
 type inode struct {
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
@@ -73,26 +66,14 @@ func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentr
 	return nil, syserror.ENXIO
 }
 
-// InitSocket initializes a socket FileDescription, with a corresponding
-// Dentry in mnt.
-//
-// fd should be the FileDescription associated with socketImpl, i.e. its first
-// field. mnt should be the global socket mount, Kernel.socketMount.
-func InitSocket(socketImpl vfs.FileDescriptionImpl, fd *vfs.FileDescription, mnt *vfs.Mount, creds *auth.Credentials) error {
-	fsimpl := mnt.Filesystem().Impl()
-	fs := fsimpl.(*kernfs.Filesystem)
-
+// NewDentry constructs and returns a sockfs dentry.
+func NewDentry(creds *auth.Credentials, ino uint64) *vfs.Dentry {
 	// File mode matches net/socket.c:sock_alloc.
 	filemode := linux.FileMode(linux.S_IFSOCK | 0600)
 	i := &inode{}
-	i.Init(creds, fs.NextIno(), filemode)
+	i.Init(creds, ino, filemode)
 
 	d := &kernfs.Dentry{}
 	d.Init(i)
-
-	opts := &vfs.FileDescriptionOptions{UseDentryMetadata: true}
-	if err := fd.Init(socketImpl, linux.O_RDWR, mnt, d.VFSDentry(), opts); err != nil {
-		return err
-	}
-	return nil
+	return d.VFSDentry()
 }

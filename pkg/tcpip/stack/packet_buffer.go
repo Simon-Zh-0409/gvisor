@@ -66,6 +66,16 @@ type PacketBuffer struct {
 	// Owner is implemented by task to get the uid and gid.
 	// Only set for locally generated packets.
 	Owner tcpip.PacketOwner
+
+	// The following fields are only set by the qdisc layer when the packet
+	// is added to a queue.
+	EgressRoute           *Route
+	GSOOptions            *GSO
+	NetworkProtocolNumber tcpip.NetworkProtocolNumber
+
+	// NatDone indicates if the packet has been manipulated as per NAT
+	// iptables rule.
+	NatDone bool
 }
 
 // Clone makes a copy of pk. It clones the Data field, which creates a new

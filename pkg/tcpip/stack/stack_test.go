@@ -128,6 +128,10 @@ func (f *fakeNetworkEndpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return f.ep.Capabilities()
 }
 
+func (f *fakeNetworkEndpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
+	return f.proto.Number()
+}
+
 func (f *fakeNetworkEndpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, pkt stack.PacketBuffer) *tcpip.Error {
 	// Increment the sent packet count in the protocol descriptor.
 	f.proto.sendPacketCount[int(r.RemoteAddress[0])%len(f.proto.sendPacketCount)]++
@@ -2872,14 +2876,25 @@ func TestIPv6SourceAddressSelectionScopeAndSameAddress(t *testing.T) {
 		globalAddr1            = tcpip.Address("\xa0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01")
 		globalAddr2            = tcpip.Address("\xa0\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02")
 		nicID                  = 1
+		lifetimeSeconds        = 9999
 	)
+
+	prefix1, _, stableGlobalAddr1 := prefixSubnetAddr(0, linkAddr1)
+	prefix2, _, stableGlobalAddr2 := prefixSubnetAddr(1, linkAddr1)
+
+	var tempIIDHistory [header.IIDSize]byte
+	header.InitialTempIID(tempIIDHistory[:], nil, nicID)
+	tempGlobalAddr1 := header.GenerateTempIPv6SLAACAddr(tempIIDHistory[:], stableGlobalAddr1.Address).Address
+	tempGlobalAddr2 := header.GenerateTempIPv6SLAACAddr(tempIIDHistory[:], stableGlobalAddr2.Address).Address
 
 	// Rule 3 is not tested here, and is instead tested by NDP's AutoGenAddr test.
 	tests := []struct {
-		name              string
-		nicAddrs          []tcpip.Address
-		connectAddr       tcpip.Address
-		expectedLocalAddr tcpip.Address
+		name                                   string
+		slaacPrefixForTempAddrBeforeNICAddrAdd tcpip.AddressWithPrefix
+		nicAddrs                               []tcpip.Address
+		slaacPrefixForTempAddrAfterNICAddrAdd  tcpip.AddressWithPrefix
+		connectAddr                            tcpip.Address
+		expectedLocalAddr                      tcpip.Address
 	}{
 		// Test Rule 1 of RFC 6724 section 5.
 		{
@@ -2969,6 +2984,22 @@ func TestIPv6SourceAddressSelectionScopeAndSameAddress(t *testing.T) {
 			expectedLocalAddr: uniqueLocalAddr1,
 		},
 
+		// Test Rule 7 of RFC 6724 section 5.
+		{
+			name:                                   "Temp Global most preferred (last address)",
+			slaacPrefixForTempAddrBeforeNICAddrAdd: prefix1,
+			nicAddrs:                               []tcpip.Address{linkLocalAddr1, uniqueLocalAddr1, globalAddr1},
+			connectAddr:                            globalAddr2,
+			expectedLocalAddr:                      tempGlobalAddr1,
+		},
+		{
+			name:                                  "Temp Global most preferred (first address)",
+			nicAddrs:                              []tcpip.Address{linkLocalAddr1, uniqueLocalAddr1, globalAddr1},
+			slaacPrefixForTempAddrAfterNICAddrAdd: prefix1,
+			connectAddr:                           globalAddr2,
+			expectedLocalAddr:                     tempGlobalAddr1,
+		},
+
 		// Test returning the endpoint that is closest to the front when
 		// candidate addresses are "equal" from the perspective of RFC 6724
 		// section 5.
@@ -2990,6 +3021,13 @@ func TestIPv6SourceAddressSelectionScopeAndSameAddress(t *testing.T) {
 			connectAddr:       uniqueLocalAddr2,
 			expectedLocalAddr: linkLocalAddr1,
 		},
+		{
+			name:                                   "Temp Global for Global",
+			slaacPrefixForTempAddrBeforeNICAddrAdd: prefix1,
+			slaacPrefixForTempAddrAfterNICAddrAdd:  prefix2,
+			connectAddr:                            globalAddr1,
+			expectedLocalAddr:                      tempGlobalAddr2,
+		},
 	}
 
 	for _, test := range tests {
@@ -2998,6 +3036,12 @@ func TestIPv6SourceAddressSelectionScopeAndSameAddress(t *testing.T) {
 			s := stack.New(stack.Options{
 				NetworkProtocols:   []stack.NetworkProtocol{ipv6.NewProtocol()},
 				TransportProtocols: []stack.TransportProtocol{udp.NewProtocol()},
+				NDPConfigs: stack.NDPConfigurations{
+					HandleRAs:                  true,
+					AutoGenGlobalAddresses:     true,
+					AutoGenTempGlobalAddresses: true,
+				},
+				NDPDisp: &ndpDispatcher{},
 			})
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
@@ -3009,10 +3053,18 @@ func TestIPv6SourceAddressSelectionScopeAndSameAddress(t *testing.T) {
 			}})
 			s.AddLinkAddress(nicID, llAddr3, linkAddr3)
 
+			if test.slaacPrefixForTempAddrBeforeNICAddrAdd != (tcpip.AddressWithPrefix{}) {
+				e.InjectInbound(header.IPv6ProtocolNumber, raBufWithPI(llAddr3, 0, test.slaacPrefixForTempAddrBeforeNICAddrAdd, true, true, lifetimeSeconds, lifetimeSeconds))
+			}
+
 			for _, a := range test.nicAddrs {
 				if err := s.AddAddress(nicID, ipv6.ProtocolNumber, a); err != nil {
 					t.Errorf("s.AddAddress(%d, %d, %s): %s", nicID, ipv6.ProtocolNumber, a, err)
 				}
+			}
+
+			if test.slaacPrefixForTempAddrAfterNICAddrAdd != (tcpip.AddressWithPrefix{}) {
+				e.InjectInbound(header.IPv6ProtocolNumber, raBufWithPI(llAddr3, 0, test.slaacPrefixForTempAddrAfterNICAddrAdd, true, true, lifetimeSeconds, lifetimeSeconds))
 			}
 
 			if t.Failed() {

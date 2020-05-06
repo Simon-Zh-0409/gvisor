@@ -17,7 +17,6 @@
 package host
 
 import (
-	"errors"
 	"fmt"
 	"math"
 	"syscall"
@@ -25,49 +24,25 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/fdnotifier"
+	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/hostfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	unixsocket "gvisor.dev/gvisor/pkg/sentry/socket/unix"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
-
-// filesystemType implements vfs.FilesystemType.
-type filesystemType struct{}
-
-// GetFilesystem implements FilesystemType.GetFilesystem.
-func (filesystemType) GetFilesystem(context.Context, *vfs.VirtualFilesystem, *auth.Credentials, string, vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
-	panic("host.filesystemType.GetFilesystem should never be called")
-}
-
-// Name implements FilesystemType.Name.
-func (filesystemType) Name() string {
-	return "none"
-}
-
-// filesystem implements vfs.FilesystemImpl.
-type filesystem struct {
-	kernfs.Filesystem
-}
-
-// NewFilesystem sets up and returns a new hostfs filesystem.
-//
-// Note that there should only ever be one instance of host.filesystem,
-// a global mount for host fds.
-func NewFilesystem(vfsObj *vfs.VirtualFilesystem) *vfs.Filesystem {
-	fs := &filesystem{}
-	fs.Init(vfsObj, filesystemType{})
-	return fs.VFSFilesystem()
-}
 
 // ImportFD sets up and returns a vfs.FileDescription from a donated fd.
 func ImportFD(ctx context.Context, mnt *vfs.Mount, hostFD int, isTTY bool) (*vfs.FileDescription, error) {
-	fs, ok := mnt.Filesystem().Impl().(*kernfs.Filesystem)
+	fs, ok := mnt.Filesystem().Impl().(*filesystem)
 	if !ok {
 		return nil, fmt.Errorf("can't import host FDs into filesystems of type %T", mnt.Filesystem().Impl())
 	}
@@ -88,11 +63,12 @@ func ImportFD(ctx context.Context, mnt *vfs.Mount, hostFD int, isTTY bool) (*vfs
 	seekable := err != syserror.ESPIPE
 
 	i := &inode{
-		hostFD:   hostFD,
-		seekable: seekable,
-		isTTY:    isTTY,
-		canMap:   canMap(uint32(fileType)),
-		ino:      fs.NextIno(),
+		hostFD:     hostFD,
+		seekable:   seekable,
+		isTTY:      isTTY,
+		canMap:     canMap(uint32(fileType)),
+		wouldBlock: wouldBlock(uint32(fileType)),
+		ino:        fs.NextIno(),
 		// For simplicity, set offset to 0. Technically, we should use the existing
 		// offset on the host if the file is seekable.
 		offset: 0,
@@ -103,12 +79,58 @@ func ImportFD(ctx context.Context, mnt *vfs.Mount, hostFD int, isTTY bool) (*vfs
 		panic("files that can return EWOULDBLOCK (sockets, pipes, etc.) cannot be memory mapped")
 	}
 
+	// If the hostFD would block, we must set it to non-blocking and handle
+	// blocking behavior in the sentry.
+	if i.wouldBlock {
+		if err := syscall.SetNonblock(i.hostFD, true); err != nil {
+			return nil, err
+		}
+		if err := fdnotifier.AddFD(int32(i.hostFD), &i.queue); err != nil {
+			return nil, err
+		}
+	}
+
 	d := &kernfs.Dentry{}
 	d.Init(i)
+
 	// i.open will take a reference on d.
 	defer d.DecRef()
-
 	return i.open(ctx, d.VFSDentry(), mnt)
+}
+
+// filesystemType implements vfs.FilesystemType.
+type filesystemType struct{}
+
+// GetFilesystem implements FilesystemType.GetFilesystem.
+func (filesystemType) GetFilesystem(context.Context, *vfs.VirtualFilesystem, *auth.Credentials, string, vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
+	panic("host.filesystemType.GetFilesystem should never be called")
+}
+
+// Name implements FilesystemType.Name.
+func (filesystemType) Name() string {
+	return "none"
+}
+
+// NewFilesystem sets up and returns a new hostfs filesystem.
+//
+// Note that there should only ever be one instance of host.filesystem,
+// a global mount for host fds.
+func NewFilesystem(vfsObj *vfs.VirtualFilesystem) *vfs.Filesystem {
+	fs := &filesystem{}
+	fs.VFSFilesystem().Init(vfsObj, filesystemType{}, fs)
+	return fs.VFSFilesystem()
+}
+
+// filesystem implements vfs.FilesystemImpl.
+type filesystem struct {
+	kernfs.Filesystem
+}
+
+func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDentry, b *fspath.Builder) error {
+	d := vd.Dentry().Impl().(*kernfs.Dentry)
+	inode := d.Inode().(*inode)
+	b.PrependComponent(fmt.Sprintf("host:[%d]", inode.ino))
+	return vfs.PrependPathSyntheticError{}
 }
 
 // inode implements kernfs.Inode.
@@ -124,6 +146,12 @@ type inode struct {
 	//
 	// This field is initialized at creation time and is immutable.
 	hostFD int
+
+	// wouldBlock is true if the host FD would return EWOULDBLOCK for
+	// operations that would block.
+	//
+	// This field is initialized at creation time and is immutable.
+	wouldBlock bool
 
 	// seekable is false if the host fd points to a file representing a stream,
 	// e.g. a socket or a pipe. Such files are not seekable and can return
@@ -152,11 +180,14 @@ type inode struct {
 
 	// offset specifies the current file offset.
 	offset int64
+
+	// Event queue for blocking operations.
+	queue waiter.Queue
 }
 
 // Note that these flags may become out of date, since they can be modified
 // on the host, e.g. with fcntl.
-func fileFlagsFromHostFD(fd int) (int, error) {
+func fileFlagsFromHostFD(fd int) (uint32, error) {
 	flags, err := unix.FcntlInt(uintptr(fd), syscall.F_GETFL, 0)
 	if err != nil {
 		log.Warningf("Failed to get file flags for donated FD %d: %v", fd, err)
@@ -164,7 +195,7 @@ func fileFlagsFromHostFD(fd int) (int, error) {
 	}
 	// TODO(gvisor.dev/issue/1672): implement behavior corresponding to these allowed flags.
 	flags &= syscall.O_ACCMODE | syscall.O_DIRECT | syscall.O_NONBLOCK | syscall.O_DSYNC | syscall.O_SYNC | syscall.O_APPEND
-	return flags, nil
+	return uint32(flags), nil
 }
 
 // CheckPermissions implements kernfs.Inode.
@@ -354,6 +385,9 @@ func (i *inode) DecRef() {
 
 // Destroy implements kernfs.Inode.
 func (i *inode) Destroy() {
+	if i.wouldBlock {
+		fdnotifier.RemoveFD(int32(i.hostFD))
+	}
 	if err := unix.Close(i.hostFD); err != nil {
 		log.Warningf("failed to close host fd %d: %v", i.hostFD, err)
 	}
@@ -361,6 +395,10 @@ func (i *inode) Destroy() {
 
 // Open implements kernfs.Inode.
 func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	// Once created, we cannot re-open a socket fd through /proc/[pid]/fd/.
+	if i.Mode().FileType() == linux.S_IFSOCK {
+		return nil, syserror.ENXIO
+	}
 	return i.open(ctx, vfsd, rp.Mount())
 }
 
@@ -370,42 +408,45 @@ func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount) (*vfs.F
 		return nil, err
 	}
 	fileType := s.Mode & linux.FileTypeMask
-	if fileType == syscall.S_IFSOCK {
-		if i.isTTY {
-			return nil, errors.New("cannot use host socket as TTY")
-		}
-		// TODO(gvisor.dev/issue/1672): support importing sockets.
-		return nil, errors.New("importing host sockets not supported")
-	}
-
-	// TODO(gvisor.dev/issue/1672): Whitelist specific file types here, so that
-	// we don't allow importing arbitrary file types without proper support.
-	var (
-		vfsfd  *vfs.FileDescription
-		fdImpl vfs.FileDescriptionImpl
-	)
-	if i.isTTY {
-		fd := &ttyFD{
-			fileDescription: fileDescription{inode: i},
-			termios:         linux.DefaultSlaveTermios,
-		}
-		vfsfd = &fd.vfsfd
-		fdImpl = fd
-	} else {
-		// For simplicity, set offset to 0. Technically, we should
-		// only set to 0 on files that are not seekable (sockets, pipes, etc.),
-		// and use the offset from the host fd otherwise.
-		fd := &fileDescription{inode: i}
-		vfsfd = &fd.vfsfd
-		fdImpl = fd
-	}
-
 	flags, err := fileFlagsFromHostFD(i.hostFD)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := vfsfd.Init(fdImpl, uint32(flags), mnt, d, &vfs.FileDescriptionOptions{}); err != nil {
+	if fileType == syscall.S_IFSOCK {
+		if i.isTTY {
+			log.Warningf("cannot use host socket fd %d as TTY", i.hostFD)
+			return nil, syserror.ENOTTY
+		}
+
+		ep, err := newEndpoint(ctx, i.hostFD, &i.queue)
+		if err != nil {
+			return nil, err
+		}
+		// Currently, we only allow Unix sockets to be imported.
+		return unixsocket.NewFileDescription(ep, ep.Type(), flags, mnt, d)
+	}
+
+	// TODO(gvisor.dev/issue/1672): Whitelist specific file types here, so that
+	// we don't allow importing arbitrary file types without proper support.
+	if i.isTTY {
+		fd := &TTYFileDescription{
+			fileDescription: fileDescription{inode: i},
+			termios:         linux.DefaultSlaveTermios,
+		}
+		vfsfd := &fd.vfsfd
+		if err := vfsfd.Init(fd, flags, mnt, d, &vfs.FileDescriptionOptions{}); err != nil {
+			return nil, err
+		}
+		return vfsfd, nil
+	}
+
+	// For simplicity, set offset to 0. Technically, we should
+	// only set to 0 on files that are not seekable (sockets, pipes, etc.),
+	// and use the offset from the host fd otherwise.
+	fd := &fileDescription{inode: i}
+	vfsfd := &fd.vfsfd
+	if err := vfsfd.Init(fd, flags, mnt, d, &vfs.FileDescriptionOptions{}); err != nil {
 		return nil, err
 	}
 	return vfsfd, nil
@@ -606,4 +647,21 @@ func (f *fileDescription) ConfigureMMap(_ context.Context, opts *memmap.MMapOpts
 	}
 	// TODO(gvisor.dev/issue/1672): Implement ConfigureMMap and Mappable interface.
 	return syserror.ENODEV
+}
+
+// EventRegister implements waiter.Waitable.EventRegister.
+func (f *fileDescription) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+	f.inode.queue.EventRegister(e, mask)
+	fdnotifier.UpdateFD(int32(f.inode.hostFD))
+}
+
+// EventUnregister implements waiter.Waitable.EventUnregister.
+func (f *fileDescription) EventUnregister(e *waiter.Entry) {
+	f.inode.queue.EventUnregister(e)
+	fdnotifier.UpdateFD(int32(f.inode.hostFD))
+}
+
+// Readiness uses the poll() syscall to check the status of the underlying FD.
+func (f *fileDescription) Readiness(mask waiter.EventMask) waiter.EventMask {
+	return fdnotifier.NonBlockingPoll(int32(f.inode.hostFD), mask)
 }

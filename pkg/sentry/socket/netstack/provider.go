@@ -33,6 +33,8 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
+// LINT.IfChange
+
 // provider is an inet socket provider.
 type provider struct {
 	family   int
@@ -166,6 +168,8 @@ func packetSocket(t *kernel.Task, epStack *Stack, stype linux.SockType, protocol
 
 	return New(t, linux.AF_PACKET, stype, protocol, wq, ep)
 }
+
+// LINT.ThenChange(./provider_vfs2.go)
 
 // Pair just returns nil sockets (not supported).
 func (*provider) Pair(*kernel.Task, linux.SockType, int) (*fs.File, *fs.File, *syserr.Error) {

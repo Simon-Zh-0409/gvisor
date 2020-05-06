@@ -53,9 +53,14 @@ type metadata struct {
 	Size       uint32
 }
 
+// enableLogging controls whether to log the (de)serialization of netfilter
+// structs between userspace and netstack. These logs are useful when
+// developing iptables, but can pollute sentry logs otherwise.
+const enableLogging = false
+
 // nflog logs messages related to the writing and reading of iptables.
 func nflog(format string, args ...interface{}) {
-	if log.IsLogging(log.Debug) {
+	if enableLogging && log.IsLogging(log.Debug) {
 		log.Debugf("netfilter: "+format, args...)
 	}
 }
@@ -246,7 +251,7 @@ func marshalTarget(target stack.Target) []byte {
 	case stack.ReturnTarget:
 		return marshalStandardTarget(stack.RuleReturn)
 	case stack.RedirectTarget:
-		return marshalRedirectTarget()
+		return marshalRedirectTarget(tg)
 	case JumpTarget:
 		return marshalJumpTarget(tg)
 	default:
@@ -283,7 +288,7 @@ func marshalErrorTarget(errorName string) []byte {
 	return binary.Marshal(ret, usermem.ByteOrder, target)
 }
 
-func marshalRedirectTarget() []byte {
+func marshalRedirectTarget(rt stack.RedirectTarget) []byte {
 	// This is a redirect target named redirect
 	target := linux.XTRedirectTarget{
 		Target: linux.XTEntryTarget{
@@ -293,6 +298,16 @@ func marshalRedirectTarget() []byte {
 	copy(target.Target.Name[:], redirectTargetName)
 
 	ret := make([]byte, 0, linux.SizeOfXTRedirectTarget)
+	target.NfRange.RangeSize = 1
+	if rt.RangeProtoSpecified {
+		target.NfRange.RangeIPV4.Flags |= linux.NF_NAT_RANGE_PROTO_SPECIFIED
+	}
+	// Convert port from little endian to big endian.
+	port := make([]byte, 2)
+	binary.LittleEndian.PutUint16(port, rt.MinPort)
+	target.NfRange.RangeIPV4.MinPort = binary.BigEndian.Uint16(port)
+	binary.LittleEndian.PutUint16(port, rt.MaxPort)
+	target.NfRange.RangeIPV4.MaxPort = binary.BigEndian.Uint16(port)
 	return binary.Marshal(ret, usermem.ByteOrder, target)
 }
 

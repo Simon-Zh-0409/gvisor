@@ -17,8 +17,6 @@
 package arch
 
 import (
-	"syscall"
-
 	"gvisor.dev/gvisor/pkg/cpuid"
 )
 
@@ -28,7 +26,7 @@ import (
 // +stateify savable
 type State struct {
 	// The system registers.
-	Regs syscall.PtraceRegs `state:".(syscallPtraceRegs)"`
+	Regs Registers
 
 	// Our floating point state.
 	x86FPState `state:"wait"`

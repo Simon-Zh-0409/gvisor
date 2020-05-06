@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/sentry/devices/memdev"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
+	devpts2 "gvisor.dev/gvisor/pkg/sentry/fsimpl/devpts"
 	devtmpfsimpl "gvisor.dev/gvisor/pkg/sentry/fsimpl/devtmpfs"
 	goferimpl "gvisor.dev/gvisor/pkg/sentry/fsimpl/gofer"
 	procimpl "gvisor.dev/gvisor/pkg/sentry/fsimpl/proc"
@@ -41,37 +42,28 @@ import (
 )
 
 func registerFilesystems(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials) error {
-
-	vfsObj.MustRegisterFilesystemType(rootFsName, &goferimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+	vfsObj.MustRegisterFilesystemType(devpts2.Name, &devpts2.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserList: true,
+		// TODO(b/29356795): Users may mount this once the terminals are in a
+		//  usable state.
+		AllowUserMount: false,
+	})
+	vfsObj.MustRegisterFilesystemType(devtmpfsimpl.Name, &devtmpfsimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+		AllowUserMount: true,
+		AllowUserList:  true,
+	})
+	vfsObj.MustRegisterFilesystemType(goferimpl.Name, &goferimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserList: true,
 	})
-
-	vfsObj.MustRegisterFilesystemType(bind, &goferimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
-		AllowUserList: true,
-	})
-
-	vfsObj.MustRegisterFilesystemType(devpts, &devtmpfsimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+	vfsObj.MustRegisterFilesystemType(procimpl.Name, &procimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
-
-	vfsObj.MustRegisterFilesystemType(devtmpfs, &devtmpfsimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+	vfsObj.MustRegisterFilesystemType(sysimpl.Name, &sysimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
-	vfsObj.MustRegisterFilesystemType(proc, &procimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
-		AllowUserMount: true,
-		AllowUserList:  true,
-	})
-	vfsObj.MustRegisterFilesystemType(sysfs, &sysimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
-		AllowUserMount: true,
-		AllowUserList:  true,
-	})
-	vfsObj.MustRegisterFilesystemType(tmpfs, &tmpfsimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
-		AllowUserMount: true,
-		AllowUserList:  true,
-	})
-	vfsObj.MustRegisterFilesystemType(nonefs, &sysimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
+	vfsObj.MustRegisterFilesystemType(tmpfsimpl.Name, &tmpfsimpl.FilesystemType{}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 		AllowUserList:  true,
 	})
@@ -108,7 +100,6 @@ func setupContainerVFS2(ctx context.Context, conf *Config, mntr *containerMounte
 }
 
 func setExecutablePathVFS2(ctx context.Context, procArgs *kernel.CreateProcessArgs) error {
-
 	exe := procArgs.Argv[0]
 
 	// Absolute paths can be used directly.
@@ -120,11 +111,9 @@ func setExecutablePathVFS2(ctx context.Context, procArgs *kernel.CreateProcessAr
 	// Paths with '/' in them should be joined to the working directory, or
 	// to the root if working directory is not set.
 	if strings.IndexByte(exe, '/') > 0 {
-
 		if !path.IsAbs(procArgs.WorkingDirectory) {
 			return fmt.Errorf("working directory %q must be absolute", procArgs.WorkingDirectory)
 		}
-
 		procArgs.Filename = path.Join(procArgs.WorkingDirectory, exe)
 		return nil
 	}
@@ -144,21 +133,17 @@ func setExecutablePathVFS2(ctx context.Context, procArgs *kernel.CreateProcessAr
 	creds := procArgs.Credentials
 
 	for _, p := range paths {
-
 		binPath := path.Join(p, exe)
-
 		pop := &vfs.PathOperation{
 			Root:               root,
 			Start:              root,
 			Path:               fspath.Parse(binPath),
 			FollowFinalSymlink: true,
 		}
-
 		opts := &vfs.OpenOptions{
 			FileExec: true,
 			Flags:    linux.O_RDONLY,
 		}
-
 		dentry, err := root.Mount().Filesystem().VirtualFilesystem().OpenAt(ctx, creds, pop, opts)
 		if err == syserror.ENOENT || err == syserror.EACCES {
 			// Didn't find it here.
@@ -181,35 +166,32 @@ func (c *containerMounter) setupVFS2(ctx context.Context, conf *Config, procArgs
 
 	// Create context with root credentials to mount the filesystem (the current
 	// user may not be privileged enough).
+	rootCreds := auth.NewRootCredentials(procArgs.Credentials.UserNamespace)
 	rootProcArgs := *procArgs
 	rootProcArgs.WorkingDirectory = "/"
-	rootProcArgs.Credentials = auth.NewRootCredentials(procArgs.Credentials.UserNamespace)
+	rootProcArgs.Credentials = rootCreds
 	rootProcArgs.Umask = 0022
 	rootProcArgs.MaxSymlinkTraversals = linux.MaxSymlinkTraversals
 	rootCtx := procArgs.NewContext(c.k)
 
-	creds := procArgs.Credentials
-	if err := registerFilesystems(rootCtx, c.k.VFS(), creds); err != nil {
+	if err := registerFilesystems(rootCtx, c.k.VFS(), rootCreds); err != nil {
 		return nil, fmt.Errorf("register filesystems: %w", err)
 	}
 
-	mns, err := c.createMountNamespaceVFS2(ctx, conf, creds)
+	mns, err := c.createMountNamespaceVFS2(rootCtx, conf, rootCreds)
 	if err != nil {
 		return nil, fmt.Errorf("creating mount namespace: %w", err)
 	}
-
 	rootProcArgs.MountNamespaceVFS2 = mns
 
 	// Mount submounts.
-	if err := c.mountSubmountsVFS2(rootCtx, conf, mns, creds); err != nil {
+	if err := c.mountSubmountsVFS2(rootCtx, conf, mns, rootCreds); err != nil {
 		return nil, fmt.Errorf("mounting submounts vfs2: %w", err)
 	}
-
 	return mns, nil
 }
 
 func (c *containerMounter) createMountNamespaceVFS2(ctx context.Context, conf *Config, creds *auth.Credentials) (*vfs.MountNamespace, error) {
-
 	fd := c.fds.remove()
 	opts := strings.Join(p9MountOptionsVFS2(fd, conf.FileAccess), ",")
 
@@ -222,7 +204,6 @@ func (c *containerMounter) createMountNamespaceVFS2(ctx context.Context, conf *C
 }
 
 func (c *containerMounter) mountSubmountsVFS2(ctx context.Context, conf *Config, mns *vfs.MountNamespace, creds *auth.Credentials) error {
-
 	c.prepareMountsVFS2()
 
 	for _, submount := range c.mounts {
@@ -256,7 +237,6 @@ func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *Config, 
 	if err != nil {
 		return fmt.Errorf("mountOptions failed: %w", err)
 	}
-
 	if fsName == "" {
 		// Filesystem is not supported (e.g. cgroup), just skip it.
 		return nil
@@ -277,7 +257,7 @@ func (c *containerMounter) mountSubmountVFS2(ctx context.Context, conf *Config, 
 	// All writes go to upper, be paranoid and make lower readonly.
 	opts.ReadOnly = useOverlay
 
-	if err := c.k.VFS().MountAt(ctx, creds, "", target, submount.Type, opts); err != nil {
+	if err := c.k.VFS().MountAt(ctx, creds, "", target, fsName, opts); err != nil {
 		return fmt.Errorf("failed to mount %q (type: %s): %w, opts: %v", submount.Destination, submount.Type, err, opts)
 	}
 	log.Infof("Mounted %q to %q type: %s, internal-options: %q", submount.Source, submount.Destination, submount.Type, opts)
@@ -336,7 +316,6 @@ func p9MountOptionsVFS2(fd int, fa FileAccessType) []string {
 }
 
 func (c *containerMounter) makeSyntheticMount(ctx context.Context, currentPath string, root vfs.VirtualDentry, creds *auth.Credentials) error {
-
 	target := &vfs.PathOperation{
 		Root:  root,
 		Start: root,
@@ -345,12 +324,10 @@ func (c *containerMounter) makeSyntheticMount(ctx context.Context, currentPath s
 
 	_, err := c.k.VFS().StatAt(ctx, creds, target, &vfs.StatOptions{})
 	switch {
-
 	case err == syserror.ENOENT:
 		if err := c.makeSyntheticMount(ctx, path.Dir(currentPath), root, creds); err != nil {
 			return err
 		}
-
 		mkdirOpts := &vfs.MkdirOptions{Mode: 0777, ForSyntheticMountpoint: true}
 		if err := c.k.VFS().MkdirAt(ctx, creds, target, mkdirOpts); err != nil {
 			return fmt.Errorf("failed to makedir for mount %+v: %w", target, err)

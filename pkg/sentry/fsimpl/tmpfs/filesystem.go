@@ -697,11 +697,14 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 }
 
 // BoundEndpointAt implements FilesystemImpl.BoundEndpointAt.
-func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath) (transport.BoundEndpoint, error) {
+func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.BoundEndpointOptions) (transport.BoundEndpoint, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
 	d, err := resolveLocked(rp)
 	if err != nil {
+		return nil, err
+	}
+	if err := d.inode.checkPermissions(rp.Credentials(), vfs.MayWrite); err != nil {
 		return nil, err
 	}
 	switch impl := d.inode.impl.(type) {

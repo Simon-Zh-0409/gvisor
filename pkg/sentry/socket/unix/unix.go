@@ -103,7 +103,7 @@ func (s *socketOpsCommon) DecRef() {
 }
 
 // Release implemements fs.FileOperations.Release.
-func (s *SocketOperations) Release() {
+func (s *socketOpsCommon) Release() {
 	// Release only decrements a reference on s because s may be referenced in
 	// the abstract socket namespace.
 	s.DecRef()
@@ -323,7 +323,10 @@ func (s *SocketOperations) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 
 			// Create the socket.
 			//
-			// TODO(gvisor.dev/issue/2324): Correctly set file permissions.
+			// Note that the file permissions here are not set correctly (see
+			// gvisor.dev/issue/2324). There is no convenient way to get permissions
+			// on the socket referred to by s, so we will leave this discrepancy
+			// unresolved until VFS2 replaces this code.
 			childDir, err := d.Bind(t, t.FSContext().RootDirectory(), name, bep, fs.FilePermissions{User: fs.PermMask{Read: true}})
 			if err != nil {
 				return syserr.ErrPortInUse
@@ -373,7 +376,7 @@ func extractEndpoint(t *kernel.Task, sockaddr []byte) (transport.BoundEndpoint, 
 			Path:               p,
 			FollowFinalSymlink: true,
 		}
-		ep, e := t.Kernel().VFS().BoundEndpointAt(t, t.Credentials(), &pop)
+		ep, e := t.Kernel().VFS().BoundEndpointAt(t, t.Credentials(), &pop, &vfs.BoundEndpointOptions{path})
 		root.DecRef()
 		if relPath {
 			start.DecRef()
